@@ -409,14 +409,6 @@ private:
     u32 mCappyHead = 0;
     u32 mCappyTail = 0;
     u32 mCappyLiveCount = 0;
-    // Guards mCappyQueue + mCappyHead/mCappyTail/mCappyLiveCount. enqueueCappyMessage
-    // (the producer) runs on the socket read thread ("ClientReadThread",
-    // Client::receiveCheck/updateSlotData) AND the game thread (pollCappyDisconnect),
-    // while tryPumpCappyMessage (the consumer) runs on the game thread — so the head/
-    // tail advance and the live-count inc/dec genuinely cross threads. hk::os::Mutex is
-    // the LibHakkun-native lock (self-contained SVC futex; no game symbol for sail to
-    // resolve, unlike sead::Mutex). Held only around the index/count mutations, never
-    // across the rs:: bubble-render call in tryPumpCappyMessage.
     hk::os::Mutex mCappyQueueMutex;
     u32 mCappyRetryFrames = 0;
     u32 mCappySettleFrames = 0;
