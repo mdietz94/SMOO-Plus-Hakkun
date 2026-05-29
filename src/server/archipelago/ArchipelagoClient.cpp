@@ -251,6 +251,22 @@ void Client::sendCheckPacket(int itemType, const char* objId, const char* stageN
     sInstance->mSocket->queuePacket(packet);
 }
 
+// ===== Cappy speech-bubble notification helper (smo_archipelago parity) =====
+// Mirrors smo_archipelago's "Got X!" item bubble. The SMOO-Plus Check packet
+// carries no sender-slot field, so there is no "from <player>" suffix (that
+// repo's Python bridge supplies the sender; this wire does not). Builds the
+// string with sead::FixedSafeString — the same idiom the surrounding handlers
+// use — which truncates rather than overruns on a long name.
+static void enqueueGotBubble(ArchipelagoMode* apMode, const char* itemName) {
+    if (apMode == nullptr)
+        return;
+    sead::FixedSafeString<128> bubble;
+    bubble = "Got ";
+    bubble.append((itemName != nullptr && itemName[0] != '\0') ? itemName : "an item");
+    bubble.append("!");
+    apMode->enqueueCappyMessage(bubble.cstr());
+}
+
 // ===== Packet Handlers =====
 void Client::receiveCheck(Check* packet) {
     if (!sInstance) {
@@ -371,6 +387,35 @@ void Client::receiveCheck(Check* packet) {
         break;
     }
 
+    // ===== Cappy speech-bubble notification (inbound AP item) =====
+    // Mirror smo_archipelago: surface received AP items as "Got X!" bubbles.
+    // Suppressed during the post-connect bulk replay (see
+    // ArchipelagoMode::shouldSuppressInboundCappy) so connects/reconnects don't
+    // spam one bubble per already-received item.
+    {
+        ArchipelagoMode* apMode = GameModeManager::instance()->getMode<ArchipelagoMode>();
+        if (apMode != nullptr && !apMode->shouldSuppressInboundCappy()) {
+            switch (itemType) {
+            case CheckType::Moon:
+                enqueueGotBubble(apMode, "Power Moon");
+                break;
+            case CheckType::Capture:
+                enqueueGotBubble(apMode, captureListNames[packet->locationId]);
+                break;
+            case CheckType::Cap:
+                enqueueGotBubble(apMode, "Cap");
+                break;
+            case CheckType::Clothes:
+                enqueueGotBubble(apMode, "Outfit");
+                break;
+            // Coins, Souvenir, Sticker and RegionalCoin intentionally omitted —
+            // too frequent / low signal for a speech bubble.
+            default:
+                break;
+            }
+        }
+    }
+
     if (updateIndex) {
         GameModeManager::instance()->getMode<ArchipelagoMode>()->setCheckIndex(packet->index);
     }
@@ -390,6 +435,8 @@ void Client::updateSlotData(SlotData* packet) {
     if (archipelagoInfo) {
         archipelagoInfo->mIsClientConnected = ArchipelagoState::CLIENT_CONNECTED;
         archipelago->setConnectInitFlag(true);
+        archipelago->noteConnectForCappySuppression();
+        archipelago->enqueueCappyMessage("Connected to Archipelago");
     } else
         return;
     archipelago->setWorldUnlockCount(1, packet->cascade);

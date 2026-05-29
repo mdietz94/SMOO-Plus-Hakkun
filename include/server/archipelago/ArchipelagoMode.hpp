@@ -11,6 +11,7 @@
 
 #include "container/seadSafeArray.h"
 #include "heap/seadExpHeap.h"
+#include "hk/os/Mutex.h"  // hk::os::Mutex — guards the cross-thread Cappy queue
 #include "server/archipelago/ArchipelagoHelpers.hpp"
 #include "server/archipelago/ArchipelagoHintArrow.h"
 #include "server/archipelago/ArchipelagoInfo.h"
@@ -213,6 +214,23 @@ public:
     // own bubbles through our substitution and corrupt them.
     static constexpr const char* kArchipelagoCappyLabel = "ArchipelagoCappyMsg";
 
+    // ===== Inbound-item Cappy suppression (smo_archipelago parity) =====
+    // noteConnectForCappySuppression() is called on (re)connect to silence the
+    // post-connect bulk item replay for kCappyConnectSuppressMs, so a reconnect
+    // doesn't fire a "Got X!" bubble for every already-received item.
+    // shouldSuppressInboundCappy() is the gate Client::receiveCheck consults
+    // before enqueuing an inbound-item bubble.
+    void noteConnectForCappySuppression();
+    bool shouldSuppressInboundCappy() const;
+    // Polled each frame from update(): fires a one-shot "Disconnected" Cappy
+    // bubble on the genuine connected -> dropped transition of the AP socket.
+    void pollCappyDisconnect();
+    // Pops the FIFO head (clears the slot, advances mCappyHead, decrements
+    // mCappyLiveCount) under mCappyQueueMutex. Consumer-only helper used by the
+    // drop/dispatch paths of tryPumpCappyMessage; the rs:: bubble-render call is
+    // kept OUTSIDE the lock so a game-frame stall never blocks the socket producer.
+    void advanceCappyHead();
+
     // ===== Archipelago Utility Methods =====
     void sendStage(GameDataHolderWriter writer, const ChangeStageInfo* stageInfo);
     void sendBack();
@@ -391,12 +409,34 @@ private:
     u32 mCappyHead = 0;
     u32 mCappyTail = 0;
     u32 mCappyLiveCount = 0;
+    // Guards mCappyQueue + mCappyHead/mCappyTail/mCappyLiveCount. enqueueCappyMessage
+    // (the producer) runs on the socket read thread ("ClientReadThread",
+    // Client::receiveCheck/updateSlotData) AND the game thread (pollCappyDisconnect),
+    // while tryPumpCappyMessage (the consumer) runs on the game thread — so the head/
+    // tail advance and the live-count inc/dec genuinely cross threads. hk::os::Mutex is
+    // the LibHakkun-native lock (self-contained SVC futex; no game symbol for sail to
+    // resolve, unlike sead::Mutex). Held only around the index/count mutations, never
+    // across the rs:: bubble-render call in tryPumpCappyMessage.
+    hk::os::Mutex mCappyQueueMutex;
     u32 mCappyRetryFrames = 0;
     u32 mCappySettleFrames = 0;
     s64 mCappySceneChangeMs = 0;
     const al::IUseSceneObjHolder* mCappyLastScene = nullptr;
     char16_t mCappyBuffer[kCappyBufferWords] = {};
     bool mCappyBufferInUse = false;
+
+    // Inbound-item bubble suppression window (wallclock ms). Set on (re)connect;
+    // Client::receiveCheck skips inbound "Got X!" bubbles until cappyNowMs()
+    // passes it, so the AP item replay burst doesn't spam Cappy.
+    static constexpr s64 kCappyConnectSuppressMs = 2000;
+    s64 mCappyInboundSuppressUntilMs = 0;
+
+    // Tracks whether the AP socket was observed live on the previous update().
+    // pollCappyDisconnect() fires the "Disconnected" bubble only on the
+    // live -> dead edge. Starts false so the init-time NOT_CONNECTED state can
+    // never produce a bubble (nothing was ever live), and so a reconnect-retry
+    // spin (socket stays dead) can't re-fire.
+    bool mCappyWasSocketLive = false;
 
     // rs:: entry-point cache. Class-static so main.cpp::hkMain can populate
     // these before any ArchipelagoMode instance exists. tryPumpCappyMessage

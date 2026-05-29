@@ -1407,6 +1407,10 @@ void ArchipelagoMode::update() {
 
         handleSoftLocks(accessor, writer);
 
+        // Detect AP socket drops and surface a one-shot "Disconnected" bubble
+        // on the genuine connected -> dropped edge (read-only socket probe).
+        pollCappyDisconnect();
+
         // Cappy speech-bubble queue pump. No-op until the rs:: function
         // pointers are wired (setCappyRsCalls is called from main.cpp once
         // hk::ro::lookupSymbol resolves both) and the scene-settle gates pass.
@@ -1581,28 +1585,75 @@ s64 cappyNowMs() {
 
 }  // namespace
 
+void ArchipelagoMode::noteConnectForCappySuppression() {
+    mCappyInboundSuppressUntilMs = cappyNowMs() + kCappyConnectSuppressMs;
+}
+
+void ArchipelagoMode::pollCappyDisconnect() {
+    // Read-only socket-liveness probe; does NOT touch the ArchipelagoState
+    // machine. Client::isSocketActive() is true iff the AP socket's
+    // socket_log_state == SOCKET_LOG_CONNECTED (it flips to DISCONNECTED in
+    // SocketClient::tryReconnect/closeSocket on a real drop). mIsClientConnected
+    // is unreliable for drop detection here — it's only ever set CLIENT_CONNECTED
+    // (in updateSlotData) and never reset to NOT_CONNECTED on a socket drop.
+    //
+    // Gate: only fire on the live -> dead edge. mCappyWasSocketLive starts false,
+    // so the init-time NOT_CONNECTED state can't bubble (nothing was live yet),
+    // and a reconnect-retry spin (socket stays dead) can't re-fire — the flag
+    // only re-arms once the socket is observed live again.
+    const bool socketLive = Client::isSocketActive();
+    if (mCappyWasSocketLive && !socketLive) {
+        if (GameModeManager::instance()->isMode(GameMode::ARCHIPELAGO)) {
+            enqueueCappyMessage("Disconnected from Archipelago");
+        }
+    }
+    mCappyWasSocketLive = socketLive;
+}
+
+bool ArchipelagoMode::shouldSuppressInboundCappy() const {
+    // Suppress during the connect-init burst and for a short wallclock window
+    // after (re)connect, so the AP item replay doesn't spam Cappy bubbles.
+    if (mIsConnectInit)
+        return true;
+    return cappyNowMs() < mCappyInboundSuppressUntilMs;
+}
+
 void ArchipelagoMode::enqueueCappyMessage(const char* utf8_text) {
     if (!utf8_text || utf8_text[0] == '\0')
         return;
+
+    // Producer side — called from BOTH the socket read thread (Client::receiveCheck/
+    // updateSlotData) and the game thread (pollCappyDisconnect). The cap check, slot
+    // copy and live-count bump run under mCappyQueueMutex as one unit so the consumer
+    // (tryPumpCappyMessage) can never observe an incremented mCappyLiveCount before
+    // the entry's text is fully written.
+    bool dropped = false;
+    mCappyQueueMutex.lock();
     if (mCappyLiveCount >= kCappyQueueCap) {
         // Drop newest. Matches smo_archipelago CappyMessenger behavior — the
         // dropped item is recent (likely a stale notification from a bulk
         // replay) and queued items are older and more representative of what
         // the player has been waiting on.
+        dropped = true;
+    } else {
+        CappyEntry& e = mCappyQueue[mCappyTail];
+        // strncpy with explicit NUL termination — strlcpy isn't available.
+        u32 i = 0;
+        while (utf8_text[i] != '\0' && i + 1 < kCappyTextCap) {
+            e.text[i] = utf8_text[i];
+            ++i;
+        }
+        e.text[i] = '\0';
+        e.live = true;
+        mCappyTail = (mCappyTail + 1) % kCappyQueueCap;
+        ++mCappyLiveCount;
+    }
+    mCappyQueueMutex.unlock();
+
+    // Log outside the lock: Logger::log does a blocking socket send when a debug
+    // logger is attached, and we must not stall the consumer (game thread) on it.
+    if (dropped)
         Logger::log("[cappy] queue full (cap=%u) — dropping '%s'\n", static_cast<unsigned>(kCappyQueueCap), utf8_text);
-        return;
-    }
-    CappyEntry& e = mCappyQueue[mCappyTail];
-    // strncpy with explicit NUL termination — strlcpy isn't available.
-    u32 i = 0;
-    while (utf8_text[i] != '\0' && i + 1 < kCappyTextCap) {
-        e.text[i] = utf8_text[i];
-        ++i;
-    }
-    e.text[i] = '\0';
-    e.live = true;
-    mCappyTail = (mCappyTail + 1) % kCappyQueueCap;
-    ++mCappyLiveCount;
 }
 
 // Class-static rs:: entry-point cache definitions. See header comment.
@@ -1612,6 +1663,18 @@ ArchipelagoMode::IsActiveCapMessageFn ArchipelagoMode::sIsActiveCapMessage = nul
 void ArchipelagoMode::setCappyRsCalls(TryShowCapMessagePriorityLowFn tryShow, IsActiveCapMessageFn isActive) {
     sTryShowCapMessage = tryShow;
     sIsActiveCapMessage = isActive;
+}
+
+void ArchipelagoMode::advanceCappyHead() {
+    // Mirror of enqueueCappyMessage's tail-advance: pop the FIFO head under the
+    // queue lock. Only the index/count state is touched here — callers do all
+    // rs:: bubble-render work OUTSIDE this lock so the game frame never blocks the
+    // socket producer thread.
+    mCappyQueueMutex.lock();
+    mCappyQueue[mCappyHead].live = false;
+    mCappyHead = (mCappyHead + 1) % kCappyQueueCap;
+    --mCappyLiveCount;
+    mCappyQueueMutex.unlock();
 }
 
 void ArchipelagoMode::tryPumpCappyMessage() {
@@ -1632,7 +1695,14 @@ void ArchipelagoMode::tryPumpCappyMessage() {
         ++mCappySettleFrames;
     }
 
-    if (mCappyLiveCount == 0)
+    // Locked read pairs with enqueueCappyMessage's unlock (release): once a
+    // non-zero count is observed here the producer's head-slot text is visible.
+    // Only this (consumer) thread decrements, so the head entry then stays valid
+    // through the unlocked utf8->utf16 read below.
+    mCappyQueueMutex.lock();
+    const bool queueEmpty = (mCappyLiveCount == 0);
+    mCappyQueueMutex.unlock();
+    if (queueEmpty)
         return;
     if (!scene)
         return;
@@ -1666,9 +1736,7 @@ void ArchipelagoMode::tryPumpCappyMessage() {
         ++mCappyRetryFrames;
         if (mCappyRetryFrames >= kCappyMaxRetryFrames) {
             Logger::log("[cappy] dropping head after %u frames (text='%s')\n", static_cast<unsigned>(mCappyRetryFrames), mCappyQueue[mCappyHead].text);
-            mCappyQueue[mCappyHead].live = false;
-            mCappyHead = (mCappyHead + 1) % kCappyQueueCap;
-            --mCappyLiveCount;
+            advanceCappyHead();
             mCappyRetryFrames = 0;
         }
         return;
@@ -1679,9 +1747,7 @@ void ArchipelagoMode::tryPumpCappyMessage() {
     const u32 written = cappyUtf8ToUtf16(e.text, mCappyBuffer, kCappyBufferWords);
     if (written == 0 && e.text[0] != '\0') {
         Logger::log("[cappy] utf8->utf16 produced empty buffer for '%s' — dropping head\n", e.text);
-        mCappyQueue[mCappyHead].live = false;
-        mCappyHead = (mCappyHead + 1) % kCappyQueueCap;
-        --mCappyLiveCount;
+        advanceCappyHead();
         mCappyRetryFrames = 0;
         return;
     }
@@ -1700,9 +1766,7 @@ void ArchipelagoMode::tryPumpCappyMessage() {
         if (mCappyRetryFrames >= kCappyMaxRetryFrames) {
             Logger::log("[cappy] dropping head after %u tryShow refusals (text='%s')\n", static_cast<unsigned>(mCappyRetryFrames),
                         mCappyQueue[mCappyHead].text);
-            mCappyQueue[mCappyHead].live = false;
-            mCappyHead = (mCappyHead + 1) % kCappyQueueCap;
-            --mCappyLiveCount;
+            advanceCappyHead();
             mCappyRetryFrames = 0;
         }
         return;
@@ -1711,9 +1775,7 @@ void ArchipelagoMode::tryPumpCappyMessage() {
     // Dispatched. Advance head; mCappyBufferInUse stays true until the
     // isActive poll above flips false (SMO keeps reading the buffer for the
     // duration of the on-screen balloon).
-    mCappyQueue[mCappyHead].live = false;
-    mCappyHead = (mCappyHead + 1) % kCappyQueueCap;
-    --mCappyLiveCount;
+    advanceCappyHead();
     mCappyRetryFrames = 0;
 }
 
